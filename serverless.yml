@@ -1,0 +1,77 @@
+# Welcome to Serverless!
+#
+# This file is the main config file for your service.
+# It's very minimal at this point and uses default values.
+# You can always add more config options for more control.
+# We've included some commented out config examples here.
+# Just uncomment any of them to get that config option.
+#
+# For full config options, check the docs:
+#    docs.serverless.com
+#
+# Happy Coding!
+
+service: serverless-go-s3-dynamo-lambda
+
+# You can pin your service to only deploy with a specific Serverless version
+# Check out our docs for more details
+# frameworkVersion: "=X.X.X"
+
+provider:
+    name: aws
+    runtime: go1.x
+    region: eu-west-1
+    iamRoleStatements:
+        - Effect: "Allow"
+          Action: "dynamodb:PutItem"
+          Resource: "*"
+        - Effect: "Allow"
+          Action: "s3:GetObject"
+          Resource: "*"
+        - Effect: "Allow"
+          Action: "sqs:SendMessage"
+          Resource: "*"
+        - Effect: "Allow"
+          Action: "sqs:ReceiveMessage"
+          Resource: "*"
+        - Effect: "Allow"
+          Action: "sqs:DeleteMessage"
+          Resource: "*"
+
+# you can overwrite defaults here
+stage: dev
+
+# you can define service wide environment variables here
+environment:
+    SQS_QUEUE_URL: https://sqs.eu-west-1.amazonaws.com/011577845742/agreement-update
+
+package:
+    exclude:
+        - ./**
+    include:
+        - ./bin/**
+
+functions:
+    schedule:
+        handler: bin/scheduler
+        timeout: 300
+        events:
+            - s3:
+                bucket: rodrigodiez-agreement-pipeline
+                event: s3:ObjectCreated:*
+                rules:
+                    - suffix: .csv
+        environment:
+            SQS_QUEUE_URL: https://sqs.eu-west-1.amazonaws.com/011577845742/agreement-update
+
+    consume:
+        handler: bin/consumer
+        timeout: 300
+        # events:
+        #     - schedule:
+        #         rate: rate(5 minutes)
+        environment:
+           DYNAMODB_TABLE: agreement
+           MAX_NUMBER_OF_MESSAGES: 10
+           VISIBILITY_TIMEOUT: 60
+           SQS_QUEUE_URL: https://sqs.eu-west-1.amazonaws.com/011577845742/agreement-update
