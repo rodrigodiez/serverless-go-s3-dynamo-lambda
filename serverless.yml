@@ -43,7 +43,7 @@ stage: dev
 
 # you can define service wide environment variables here
 environment:
-    SQS_QUEUE_URL: https://sqs.eu-west-1.amazonaws.com/011577845742/agreement-update
+    SQS_QUEUE_URL: https://sqs.eu-west-1.amazonaws.com/011577845742/agreements-update
 
 package:
     exclude:
@@ -55,6 +55,7 @@ functions:
     schedule:
         handler: bin/scheduler
         timeout: 300
+        memorySize: 3008
         events:
             - s3:
                 bucket: rodrigodiez-agreement-pipeline
@@ -62,7 +63,8 @@ functions:
                 rules:
                     - suffix: .csv
         environment:
-            SQS_QUEUE_URL: https://sqs.eu-west-1.amazonaws.com/011577845742/agreement-update
+            SQS_QUEUE_URL: https://sqs.eu-west-1.amazonaws.com/011577845742/agreements-update
+            NUM_WORKERS: 10
 
     consume:
         handler: bin/consumer
@@ -74,4 +76,4 @@ functions:
            DYNAMODB_TABLE: agreement
            MAX_NUMBER_OF_MESSAGES: 10
            VISIBILITY_TIMEOUT: 60
-           SQS_QUEUE_URL: https://sqs.eu-west-1.amazonaws.com/011577845742/agreement-update
+           SQS_QUEUE_URL: https://sqs.eu-west-1.amazonaws.com/011577845742/agreements-update
