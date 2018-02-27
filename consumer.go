@@ -4,8 +4,6 @@ import (
 	"os"
 	"fmt"
 	"strconv"
-	"time"
-	"context"
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/aws/aws-lambda-go/lambda"
 	"github.com/aws/aws-sdk-go/aws"
@@ -17,88 +15,185 @@ import (
 	"sync"
 )
 
-func Handler(ctx context.Context, event *events.S3Event) error {
-	var messageCount int = 0;
-	sqsUrl := os.Getenv("SQS_QUEUE_URL")
-	maxMessages, _ := strconv.ParseInt(os.Getenv("MAX_NUMBER_OF_MESSAGES"), 10, 64)
-	visibilityTimeout, _ := strconv.ParseInt(os.Getenv("VISIBILITY_TIMEOUT"), 10, 64)
+type Consumer struct {
+	svc *sqs.SQS
+	url *string
+	jobs chan *sqs.Message
+	wg *sync.WaitGroup
+}
 
-	deadline, _ := ctx.Deadline()
+type Deleter struct {
+	svc *sqs.SQS
+	url *string
+	jobs chan *sqs.Message
+	wg *sync.WaitGroup
+}
 
-	sess := session.New()
- 	dynamoSvc := dynamodb.New(sess, aws.NewConfig().WithRegion("eu-west-1"))
- 	sqsSvc := sqs.New(sess, aws.NewConfig().WithRegion("eu-west-1"))
+type Inserter struct {
+	svc *dynamodb.DynamoDB
+	jobs chan *sqs.Message
+	deleteJobs chan *sqs.Message
+	wg *sync.WaitGroup
+}
 
-	for {
-		if time.Until(deadline) < 1 * time.Second {
-			fmt.Println("Terminating lambda before hard timeout");
-			fmt.Println("Processed messages", messageCount);
-			return nil
-		}
-
-		fmt.Println("Time until deadline", time.Until(deadline))
-		result, err := sqsSvc.ReceiveMessage(&sqs.ReceiveMessageInput{
-			QueueUrl:            &sqsUrl,
-			MaxNumberOfMessages: aws.Int64(maxMessages),
-			VisibilityTimeout:   aws.Int64(visibilityTimeout),
-			WaitTimeSeconds:     aws.Int64(0),
-		})
-
-		if err != nil {
-			fmt.Println(err)
-			return err
-		}
-
-		if len(result.Messages) == 0 {
-			fmt.Println("No more messages")
-			fmt.Println("Processed messages", messageCount);
-
-			return nil
-		}
-
-		var wg sync.WaitGroup
-
-		for _, message := range result.Messages {
-			wg.Add(1)
-			messageCount ++;
-			go handleMessage(message, sqsSvc, dynamoSvc, &wg)
-		}
-
-		wg.Wait()
+func NewDeleter(svc *sqs.SQS, url *string, jobs chan *sqs.Message, wg *sync.WaitGroup) *Deleter {
+	return &Deleter{
+		svc: svc,
+		url: url,
+		jobs: jobs,
+		wg: wg,
 	}
 }
 
-func handleMessage(message *sqs.Message, sqsSvc *sqs.SQS, dynamoSvc *dynamodb.DynamoDB, wg *sync.WaitGroup) {
-	defer wg.Done()
+func NewConsumer(svc *sqs.SQS, url *string, jobs chan *sqs.Message, wg *sync.WaitGroup) *Consumer {
+	return &Consumer{
+		svc: svc,
+		url: url,
+		jobs: jobs,
+		wg: wg,
+	}
+}
 
-	var agreement Agreement
+func NewInserter(svc *dynamodb.DynamoDB, jobs chan *sqs.Message, deleteJobs chan *sqs.Message, wg *sync.WaitGroup) *Inserter {
+	return &Inserter{
+		svc: svc,
+		jobs: jobs,
+		deleteJobs: deleteJobs,
+		wg: wg,
+	}
+}
+
+func (w Deleter) Start() {
+	w.wg.Add(1)
+	fmt.Println("deleter: Added to the wg")
+
+	go func (){
+		for job := range w.jobs {
+			_, err := w.svc.DeleteMessage(&sqs.DeleteMessageInput{
+				QueueUrl:      w.url,
+				ReceiptHandle: job.ReceiptHandle,
+			})
+
+			if err != nil {
+				fmt.Println(err)
+			} else {
+				fmt.Println("deleter: message deleted", job.MessageId)
+			}
+		}
+
+		fmt.Println("deleter: jobs channel closed. I am done")
+		w.wg.Done()
+
+		return
+	}()
+}
+
+func (w Consumer) Start() {
+	w.wg.Add(1)
+	fmt.Println("consumer: Added to the wg")
+
+	go func (){
+
+		for {
+			result, err := w.svc.ReceiveMessage(&sqs.ReceiveMessageInput{
+				QueueUrl:            w.url,
+				MaxNumberOfMessages: aws.Int64(10),
+				VisibilityTimeout:   aws.Int64(60),
+				WaitTimeSeconds:     aws.Int64(0),
+			})
+
+			if err != nil {
+				fmt.Println(err)
+				break
+			}
+
+			if len(result.Messages) == 0 {
+				fmt.Println("consumer: No more messages. I am done")
+				w.wg.Done()
+
+				return
+			}
+
+			for _, message := range result.Messages {
+				w.jobs <- message
+			}
+		}
+	}()
+
+}
+
+func (w Inserter) Start() {
+	w.wg.Add(1)
+	fmt.Println("inserter: Added to the wg")
+
+	go func () {
+
+		for job := range w.jobs {
+			var agreement Agreement
+
+			json.Unmarshal([]byte(*job.Body), &agreement)
+			dynamoAgreement, _ := dynamodbattribute.MarshalMap(agreement)
+
+			_, err := w.svc.PutItem(&dynamodb.PutItemInput{
+				TableName: aws.String("agreement"),
+				Item:      dynamoAgreement,
+			})
+
+			if err != nil {
+				fmt.Println("Error calling PutItem")
+				fmt.Println(err.Error())
+			} else {
+				w.deleteJobs <- job
+			}
+		}
+
+		fmt.Println("inserter: jobs channel closed. I am done")
+		w.wg.Done()
+
+		return
+	}()
+
+}
+
+func Handler(event *events.S3Event) error {
 	sqsUrl := os.Getenv("SQS_QUEUE_URL")
+	sess := session.New()
+ 	dynamoSvc := dynamodb.New(sess, aws.NewConfig().WithRegion("eu-west-1"))
+ 	sqsSvc := sqs.New(sess, aws.NewConfig().WithRegion("eu-west-1"))
+	numConsumers, _ := strconv.Atoi(os.Getenv("NUM_CONSUMERS"))
+	numInserters, _ := strconv.Atoi(os.Getenv("NUM_INSERTERS"))
+	numDeleters, _ := strconv.Atoi(os.Getenv("NUM_DELETERS"))
 
-	json.Unmarshal([]byte(*message.Body), &agreement)
-	dynamoAgreement, _ := dynamodbattribute.MarshalMap(agreement)
+	jobs := make(chan *sqs.Message, 100)
+	deleteJobs := make(chan *sqs.Message, 100)
+	consumerWg := new(sync.WaitGroup)
+	inserterWg := new(sync.WaitGroup)
+	deleterWg := new(sync.WaitGroup)
 
-	_, err := dynamoSvc.PutItem(&dynamodb.PutItemInput{
-		TableName: aws.String(os.Getenv("DYNAMODB_TABLE")),
-		Item:      dynamoAgreement,
-	})
-
-	if err != nil {
-		fmt.Println("Error calling PutItem")
-		fmt.Println(err.Error())
-		return
+	for i:=0; i < numConsumers; i++ {
+		NewConsumer(sqsSvc, &sqsUrl, jobs, consumerWg).Start()
 	}
 
-	_, err = sqsSvc.DeleteMessage(&sqs.DeleteMessageInput{
-		QueueUrl:      &sqsUrl,
-		ReceiptHandle: message.ReceiptHandle,
-	})
-
-	if err != nil {
-		fmt.Println(err)
-		return
+	for i:=0; i < numInserters; i++ {
+		NewInserter(dynamoSvc, jobs, deleteJobs, inserterWg).Start()
 	}
 
-	fmt.Println("Message deleted", message.MessageId)
+	for i:=0; i < numDeleters; i++ {
+		NewDeleter(sqsSvc, &sqsUrl, deleteJobs, deleterWg).Start()
+	}
+
+	consumerWg.Wait()
+	fmt.Println("All consumers finished. Closing jobs channel")
+	close(jobs)
+
+	inserterWg.Wait()
+	fmt.Println("All inserters finished. Closing deleteJobs channel")
+	close(deleteJobs)
+
+	deleterWg.Wait()
+	fmt.Println("All deleters finished. We are DONE!")
+
+	return nil
 }
 
 func main() {
